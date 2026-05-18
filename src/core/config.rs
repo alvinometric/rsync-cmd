@@ -10,7 +10,8 @@ pub struct Config {
     pub destination: Destination,
     pub schedule: Schedule,
     pub excludes: Vec<String>,
-    pub versioning: Versioning,
+    #[serde(default)]
+    pub versioning: Option<Versioning>,
     pub mirror: bool,
 }
 
@@ -20,15 +21,15 @@ impl Default for Config {
             version: CONFIG_VERSION,
             sources: Vec::new(),
             destination: Destination {
-                drive_id: String::new(),
+                drive_id: None,
                 path: PathBuf::new(),
             },
             schedule: Schedule::Manual,
             excludes: Vec::new(),
-            versioning: Versioning {
-                enabled: true,
+            versioning: Some(Versioning {
                 retention: RetentionPolicy::KeepLast { count: 30 },
-            },
+                snapshots_path: None,
+            }),
             mirror: false,
         }
     }
@@ -36,7 +37,8 @@ impl Default for Config {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Destination {
-    pub drive_id: String,
+    #[serde(default)]
+    pub drive_id: Option<String>,
     pub path: PathBuf,
 }
 
@@ -63,8 +65,9 @@ pub enum Weekday {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Versioning {
-    pub enabled: bool,
     pub retention: RetentionPolicy,
+    #[serde(default)]
+    pub snapshots_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,7 +83,7 @@ pub enum ConfigError {
     UnsupportedVersion(u32),
     InvalidScheduleTime,
     EmptySources,
-    EmptyDestinationDrive,
+    DestinationHasNoParent,
 }
 
 impl std::fmt::Display for ConfigError {
@@ -89,7 +92,10 @@ impl std::fmt::Display for ConfigError {
             ConfigError::UnsupportedVersion(v) => write!(f, "unsupported config version: {v}"),
             ConfigError::InvalidScheduleTime => write!(f, "invalid schedule time"),
             ConfigError::EmptySources => write!(f, "config has no sources"),
-            ConfigError::EmptyDestinationDrive => write!(f, "config destination drive is empty"),
+            ConfigError::DestinationHasNoParent => write!(
+                f,
+                "destination has no parent directory; set versioning.snapshots_path explicitly"
+            ),
         }
     }
 }
@@ -103,8 +109,17 @@ pub fn validate(config: &Config) -> Result<(), ConfigError> {
     if config.sources.is_empty() {
         return Err(ConfigError::EmptySources);
     }
-    if config.destination.drive_id.is_empty() {
-        return Err(ConfigError::EmptyDestinationDrive);
+    if let Some(versioning) = &config.versioning
+        && versioning.snapshots_path.is_none()
+    {
+        let has_parent = config
+            .destination
+            .path
+            .parent()
+            .is_some_and(|p| !p.as_os_str().is_empty());
+        if !has_parent {
+            return Err(ConfigError::DestinationHasNoParent);
+        }
     }
     match config.schedule {
         Schedule::Manual | Schedule::Interval { .. } => {}
@@ -181,12 +196,16 @@ mod tests {
                         version: CONFIG_VERSION,
                         sources: sources.into_iter().map(PathBuf::from).collect(),
                         destination: Destination {
-                            drive_id,
+                            drive_id: Some(drive_id),
                             path: PathBuf::from(dest_path),
                         },
                         schedule,
                         excludes,
-                        versioning: Versioning { enabled: ver_enabled, retention },
+                        versioning: if ver_enabled {
+                            Some(Versioning { retention, snapshots_path: None })
+                        } else {
+                            None
+                        },
                         mirror,
                     }
                 },
@@ -205,8 +224,8 @@ mod tests {
     #[test]
     fn default_config_validates_after_setting_required_fields() {
         let mut c = Config::default();
-        c.sources.push(PathBuf::from("/home/alvin/docs"));
-        c.destination.drive_id = "drive-123".into();
+        c.sources.push(PathBuf::from("/x"));
+        c.destination.path = PathBuf::from("/mnt/backup/live");
         validate(&c).unwrap();
     }
 
@@ -214,7 +233,7 @@ mod tests {
     fn rejects_unsupported_version() {
         let mut c = Config::default();
         c.sources.push(PathBuf::from("/x"));
-        c.destination.drive_id = "d".into();
+        c.destination.path = PathBuf::from("/mnt/backup/live");
         c.version = 999;
         assert_eq!(validate(&c), Err(ConfigError::UnsupportedVersion(999)));
     }
@@ -223,15 +242,31 @@ mod tests {
     fn rejects_invalid_schedule_time() {
         let mut c = Config::default();
         c.sources.push(PathBuf::from("/x"));
-        c.destination.drive_id = "d".into();
+        c.destination.path = PathBuf::from("/mnt/backup/live");
         c.schedule = Schedule::DailyAt { hour: 25, minute: 0 };
         assert_eq!(validate(&c), Err(ConfigError::InvalidScheduleTime));
     }
 
     #[test]
-    fn rejects_empty_sources() {
+    fn rejects_destination_with_no_parent_when_versioning_default() {
         let mut c = Config::default();
-        c.destination.drive_id = "d".into();
+        c.sources.push(PathBuf::from("/x"));
+        c.destination.path = PathBuf::from("/");
+        assert_eq!(validate(&c), Err(ConfigError::DestinationHasNoParent));
+    }
+
+    #[test]
+    fn accepts_destination_with_no_parent_when_snapshots_path_explicit() {
+        let mut c = Config::default();
+        c.sources.push(PathBuf::from("/x"));
+        c.destination.path = PathBuf::from("/");
+        c.versioning.as_mut().unwrap().snapshots_path = Some(PathBuf::from("/snaps"));
+        validate(&c).unwrap();
+    }
+
+    #[test]
+    fn rejects_empty_sources() {
+        let c = Config::default();
         assert_eq!(validate(&c), Err(ConfigError::EmptySources));
     }
 }
